@@ -1,0 +1,1175 @@
+#!/usr/bin/env python3
+"""gpumon - lightweight GPU usage history for shared machines.
+
+One small background collector samples every GPU through NVML (ctypes, no
+dependencies), aggregates to 1-minute rows in SQLite, and rolls those up to
+hourly rows. Anyone on the machine can then view the last hour / day / week as
+terminal heatmaps and charts, which works fine over plain SSH.
+
+Subcommands:
+  gpumon                    overview: now / 1h / 24h / 7d for every GPU
+  gpumon show -r 24h        detailed heatmap + chart for one range
+  gpumon users -r 7d        who (user or container) occupied which GPUs
+  gpumon free               GPUs that are idle right now (and recently)
+  gpumon status             collector health and storage used
+  gpumon export -r 24h      CSV dump
+  gpumon collect            run the collector (normally started by cron)
+  gpumon stop               stop the collector
+
+Only the Python standard library is used.
+"""
+
+import argparse
+import contextlib
+import ctypes
+import csv
+import datetime as dt
+import fcntl
+import os
+import pwd
+import re
+import shutil
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+
+VERSION = "1.0"
+DEFAULT_DATA_DIR = "/var/tmp/gpumon/data"
+SAMPLE_INTERVAL = 5            # seconds between NVML samples
+MINUTE_RETENTION = 8 * 86400   # keep 1-minute rows this long (covers the 7d view)
+HOURLY_RETENTION = 400 * 86400 # keep hourly rows this long
+LOG_MAX_BYTES = 1 << 20
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS gpus(
+  gpu INTEGER PRIMARY KEY, uuid TEXT, name TEXT,
+  mem_total INTEGER, power_limit INTEGER, updated INTEGER);
+CREATE TABLE IF NOT EXISTS minute(
+  ts INTEGER, gpu INTEGER, util INTEGER, util_max INTEGER,
+  mem INTEGER, mem_max INTEGER, power INTEGER, temp INTEGER, n INTEGER,
+  PRIMARY KEY(ts, gpu)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS hourly(
+  ts INTEGER, gpu INTEGER, util INTEGER, util_max INTEGER,
+  mem INTEGER, mem_max INTEGER, power INTEGER, temp INTEGER, n INTEGER,
+  PRIMARY KEY(ts, gpu)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS proc_minute(
+  ts INTEGER, gpu INTEGER, owner TEXT, mem INTEGER,
+  PRIMARY KEY(ts, gpu, owner)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS proc_hourly(
+  ts INTEGER, gpu INTEGER, owner TEXT, minutes INTEGER, mem INTEGER, util_sum INTEGER,
+  PRIMARY KEY(ts, gpu, owner)) WITHOUT ROWID;
+"""
+# Units: util in %, mem in MiB, power in W, temp in C. Minute rows are the
+# per-minute mean (util/mem/power) or max (util_max/mem_max/temp) of n samples.
+# proc_hourly.util_sum is the sum over minutes of the GPU's utilization, so
+# util_sum/100 is "busy GPU-minutes".
+
+
+def data_dir(args=None):
+    d = getattr(args, "data", None) or os.environ.get("GPUMON_DATA") or DEFAULT_DATA_DIR
+    return os.path.abspath(os.path.expanduser(d))
+
+
+def db_path(args=None):
+    return os.path.join(data_dir(args), "gpumon.db")
+
+
+# --------------------------------------------------------------------------
+# NVML via ctypes
+# --------------------------------------------------------------------------
+
+class NVMLError(Exception):
+    pass
+
+
+class _Util(ctypes.Structure):
+    _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+
+class _Mem(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong),
+                ("used", ctypes.c_ulonglong)]
+
+
+class NVML:
+    """Minimal NVML binding: just the calls gpumon needs."""
+
+    def __init__(self):
+        try:
+            self.lib = ctypes.CDLL("libnvidia-ml.so.1")
+        except OSError as e:
+            raise NVMLError("cannot load libnvidia-ml.so.1: %s" % e)
+        self._call("nvmlInit_v2")
+        n = ctypes.c_uint()
+        self._call("nvmlDeviceGetCount_v2", ctypes.byref(n))
+        self.handles = []
+        for i in range(n.value):
+            h = ctypes.c_void_p()
+            self._call("nvmlDeviceGetHandleByIndex_v2", ctypes.c_uint(i), ctypes.byref(h))
+            self.handles.append(h)
+
+    def _call(self, fn, *args):
+        rc = getattr(self.lib, fn)(*args)
+        if rc != 0:
+            raise NVMLError("%s failed (NVML error %d)" % (fn, rc))
+
+    def _try(self, fn, *args):
+        try:
+            self._call(fn, *args)
+            return True
+        except NVMLError:
+            return False
+
+    def close(self):
+        try:
+            self.lib.nvmlShutdown()
+        except Exception:
+            pass
+
+    def info(self, i):
+        h = self.handles[i]
+        buf = ctypes.create_string_buffer(96)
+        self._call("nvmlDeviceGetName", h, buf, ctypes.c_uint(96))
+        name = buf.value.decode(errors="replace")
+        self._call("nvmlDeviceGetUUID", h, buf, ctypes.c_uint(96))
+        uuid = buf.value.decode(errors="replace")
+        m = _Mem()
+        self._call("nvmlDeviceGetMemoryInfo", h, ctypes.byref(m))
+        p = ctypes.c_uint()
+        plimit = p.value // 1000 if self._try("nvmlDeviceGetEnforcedPowerLimit", h, ctypes.byref(p)) else None
+        return {"name": name, "uuid": uuid, "mem_total": m.total >> 20, "power_limit": plimit}
+
+    def sample(self, i):
+        """Return (util %, mem MiB, power W, temp C); power/temp may be None."""
+        h = self.handles[i]
+        u, m = _Util(), _Mem()
+        self._call("nvmlDeviceGetUtilizationRates", h, ctypes.byref(u))
+        self._call("nvmlDeviceGetMemoryInfo", h, ctypes.byref(m))
+        p, t = ctypes.c_uint(), ctypes.c_uint()
+        power = p.value / 1000.0 if self._try("nvmlDeviceGetPowerUsage", h, ctypes.byref(p)) else None
+        temp = t.value if self._try("nvmlDeviceGetTemperature", h, ctypes.c_int(0), ctypes.byref(t)) else None
+        return u.gpu, m.used / 1048576.0, power, temp
+
+
+# --------------------------------------------------------------------------
+# Process -> owner attribution
+# --------------------------------------------------------------------------
+
+_CONTAINER_RE = re.compile(r"([0-9a-f]{64})")
+_container_names = {}
+
+
+def _container_name(cid):
+    if cid not in _container_names:
+        name = None
+        if shutil.which("docker"):
+            try:
+                out = subprocess.run(["docker", "inspect", "--format", "{{.Name}}", cid],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0:
+                    name = out.stdout.strip().lstrip("/")
+            except (OSError, subprocess.SubprocessError):
+                pass
+        _container_names[cid] = "ctr:" + (name or cid[:12])
+    return _container_names[cid]
+
+
+def pid_owner(pid):
+    """Container name for containerized processes, otherwise the Unix user."""
+    try:
+        with open("/proc/%d/cgroup" % pid) as f:
+            m = _CONTAINER_RE.search(f.read())
+        if m:
+            return _container_name(m.group(1))
+        uid = os.stat("/proc/%d" % pid).st_uid
+    except OSError:
+        return "unknown"
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return "uid:%d" % uid
+
+
+def sample_processes(uuid_to_gpu):
+    """{(gpu, owner): MiB} for running compute processes, via nvidia-smi."""
+    out = {}
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory",
+                            "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return out
+    if r.returncode != 0:
+        return out
+    for line in r.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 3 or parts[0] not in uuid_to_gpu:
+            continue
+        try:
+            pid = int(parts[1])
+            mem = int(parts[2]) if parts[2].isdigit() else 0
+        except ValueError:
+            continue
+        key = (uuid_to_gpu[parts[0]], pid_owner(pid))
+        out[key] = out.get(key, 0) + mem
+    if len(_container_names) > 500:
+        _container_names.clear()
+    return out
+
+
+# --------------------------------------------------------------------------
+# Collector
+# --------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def transaction(db):
+    """Explicit transaction (the connection runs in autocommit mode)."""
+    db.execute("BEGIN")
+    try:
+        yield db
+        db.execute("COMMIT")
+    except BaseException:
+        # A failed COMMIT (e.g. "database is locked") leaves the transaction
+        # open; without this rollback the collector would hold the write lock
+        # forever and every later BEGIN and reader would fail.
+        if db.in_transaction:
+            db.execute("ROLLBACK")
+        raise
+
+
+class Collector:
+    def __init__(self, args):
+        self.args = args
+        self.dir = data_dir(args)
+        self.interval = args.interval
+        self.log_path = os.path.join(self.dir, "collector.log")
+        self.nvml = None
+        self.uuid_to_gpu = {}
+        self.acc = {}
+
+    def log(self, msg):
+        try:
+            if os.path.exists(self.log_path) and os.path.getsize(self.log_path) > LOG_MAX_BYTES:
+                os.replace(self.log_path, self.log_path + ".1")
+            with open(self.log_path, "a") as f:
+                f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+        except OSError:
+            pass
+        if self.args.foreground:
+            print(msg, file=sys.stderr)
+
+    def open_db(self):
+        db = sqlite3.connect(db_path(self.args), timeout=30, isolation_level=None)
+        # Rollback journal (not WAL) so read-only users need no write access.
+        db.execute("PRAGMA journal_mode=DELETE")
+        db.execute("PRAGMA synchronous=NORMAL")
+        db.executescript(SCHEMA)
+        return db
+
+    def init_nvml(self, db):
+        self.nvml = NVML()
+        now = int(time.time())
+        self.uuid_to_gpu = {}
+        with transaction(db):
+            for i in range(len(self.nvml.handles)):
+                info = self.nvml.info(i)
+                self.uuid_to_gpu[info["uuid"]] = i
+                db.execute("INSERT OR REPLACE INTO gpus VALUES(?,?,?,?,?,?)",
+                           (i, info["uuid"], info["name"], info["mem_total"],
+                            info["power_limit"], now))
+        self.log("NVML ready: %d GPU(s)" % len(self.nvml.handles))
+
+    def take_sample(self):
+        for i in range(len(self.nvml.handles)):
+            util, mem, power, temp = self.nvml.sample(i)
+            a = self.acc.get(i)
+            if a is None:
+                a = self.acc[i] = {"n": 0, "util": 0.0, "util_max": 0, "mem": 0.0, "mem_max": 0.0,
+                                   "power": 0.0, "pn": 0, "temp": None}
+            a["n"] += 1
+            a["util"] += util
+            a["util_max"] = max(a["util_max"], util)
+            a["mem"] += mem
+            a["mem_max"] = max(a["mem_max"], mem)
+            if power is not None:
+                a["power"] += power
+                a["pn"] += 1
+            if temp is not None:
+                a["temp"] = temp if a["temp"] is None else max(a["temp"], temp)
+
+    def flush(self, db, minute_ts, with_procs=True):
+        rows = []
+        for gpu, a in self.acc.items():
+            n = a["n"]
+            if not n:
+                continue
+            rows.append((minute_ts, gpu, round(a["util"] / n), a["util_max"],
+                         round(a["mem"] / n), round(a["mem_max"]),
+                         round(a["power"] / a["pn"]) if a["pn"] else None, a["temp"], n))
+        self.acc = {}
+        procs = sample_processes(self.uuid_to_gpu) if (with_procs and rows) else {}
+        with transaction(db):
+            db.executemany("INSERT OR REPLACE INTO minute VALUES(?,?,?,?,?,?,?,?,?)", rows)
+            db.executemany("INSERT OR REPLACE INTO proc_minute VALUES(?,?,?,?)",
+                           [(minute_ts, g, o, m) for (g, o), m in procs.items()])
+            db.execute("INSERT OR REPLACE INTO meta VALUES('last_flush', ?)", (str(int(time.time())),))
+
+    def maintain(self, db):
+        """Roll finished hours into the hourly tables and apply retention."""
+        hour_now = int(time.time()) // 3600 * 3600
+        row = db.execute("SELECT value FROM meta WHERE key='rolled_until'").fetchone()
+        if row:
+            start = int(row[0])
+        else:
+            first = db.execute("SELECT MIN(ts) FROM minute").fetchone()[0]
+            start = first // 3600 * 3600 if first is not None else hour_now
+        if start >= hour_now:
+            return
+        with transaction(db):
+            db.execute("""INSERT OR REPLACE INTO hourly
+                SELECT ts/3600*3600, gpu, ROUND(AVG(util)), MAX(util_max), ROUND(AVG(mem)),
+                       MAX(mem_max), ROUND(AVG(power)), MAX(temp), SUM(n)
+                FROM minute WHERE ts >= ? AND ts < ? GROUP BY 1, 2""", (start, hour_now))
+            db.execute("""INSERT OR REPLACE INTO proc_hourly
+                SELECT p.ts/3600*3600, p.gpu, p.owner, COUNT(*), ROUND(AVG(p.mem)),
+                       COALESCE(SUM(m.util), 0)
+                FROM proc_minute p LEFT JOIN minute m ON m.ts = p.ts AND m.gpu = p.gpu
+                WHERE p.ts >= ? AND p.ts < ? GROUP BY 1, 2, 3""", (start, hour_now))
+            cutoff = hour_now - MINUTE_RETENTION
+            db.execute("DELETE FROM minute WHERE ts < ?", (cutoff,))
+            db.execute("DELETE FROM proc_minute WHERE ts < ?", (cutoff,))
+            db.execute("DELETE FROM hourly WHERE ts < ?", (hour_now - HOURLY_RETENTION,))
+            db.execute("DELETE FROM proc_hourly WHERE ts < ?", (hour_now - HOURLY_RETENTION,))
+            db.execute("INSERT OR REPLACE INTO meta VALUES('rolled_until', ?)", (str(hour_now),))
+
+    def run(self):
+        db = self.open_db()
+        self.log("collector started (pid %d, interval %ss)" % (os.getpid(), self.interval))
+        cur_min = int(time.time()) // 60
+        try:
+            while True:
+                if self.nvml is None:
+                    try:
+                        self.init_nvml(db)
+                    except NVMLError as e:
+                        self.log("NVML unavailable: %s; retrying in 60s" % e)
+                        time.sleep(60)
+                        cur_min = int(time.time()) // 60
+                        continue
+                try:
+                    self.take_sample()
+                except NVMLError as e:
+                    self.log("sample failed: %s; reinitializing" % e)
+                    self.nvml.close()
+                    self.nvml = None
+                    continue
+                now = time.time()
+                if int(now) // 60 != cur_min:
+                    try:
+                        self.flush(db, cur_min * 60)
+                        self.maintain(db)
+                    except sqlite3.Error as e:
+                        self.log("database error: %s" % e)
+                    cur_min = int(now) // 60
+                time.sleep(self.interval - (time.time() % self.interval))
+        finally:
+            try:
+                self.flush(db, cur_min * 60, with_procs=False)
+            except Exception:
+                pass
+            self.log("collector stopped")
+
+
+def _raise_exit(signum, frame):
+    raise SystemExit(0)
+
+
+def cmd_collect(args):
+    os.umask(0o022)  # data must stay readable by everyone
+    d = data_dir(args)
+    try:
+        os.makedirs(d, mode=0o755, exist_ok=True)
+        lock = open(os.path.join(d, "collector.pid"), "a+")
+    except PermissionError:
+        sys.exit("gpumon: no write access to %s; the collector is run by that directory's owner" % d)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if not args.quiet:
+            lock.seek(0)
+            print("collector already running (pid %s)" % (lock.read().strip() or "?"))
+        return 0
+    lock.seek(0)
+    lock.truncate()
+    lock.write(str(os.getpid()))
+    lock.flush()
+    signal.signal(signal.SIGTERM, _raise_exit)
+    signal.signal(signal.SIGHUP, _raise_exit)
+    try:
+        os.nice(10)
+    except OSError:
+        pass
+    try:
+        Collector(args).run()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def collector_pid(args):
+    """PID of the running collector, or None."""
+    path = os.path.join(data_dir(args), "collector.pid")
+    try:
+        with open(path) as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                fcntl.flock(f, fcntl.LOCK_UN)
+                return None  # nobody holds the lock
+            except OSError:
+                pass
+            txt = f.read().strip()
+            return int(txt) if txt.isdigit() else -1
+    except OSError:
+        # Can't read the pid file; fall back to data freshness in callers.
+        return None
+
+
+def cmd_stop(args):
+    pid = collector_pid(args)
+    if not pid or pid < 0:
+        print("collector is not running")
+        return 1
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except PermissionError:
+        print("collector (pid %d) belongs to another user" % pid)
+        return 1
+    except ProcessLookupError:
+        print("collector is not running")
+        return 1
+    print("stopped collector (pid %d)" % pid)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Reading data
+# --------------------------------------------------------------------------
+
+def open_ro(args):
+    path = db_path(args)
+    if not os.path.exists(path):
+        sys.exit("gpumon: no data at %s (is the collector installed? see `gpumon status`)" % path)
+    db = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=10)
+    return db
+
+
+def gpu_info(db):
+    return {r[0]: {"uuid": r[1], "name": r[2], "mem_total": r[3] or 0, "power_limit": r[4] or 0}
+            for r in db.execute("SELECT gpu, uuid, name, mem_total, power_limit FROM gpus ORDER BY gpu")}
+
+
+def data_source(db, start, end):
+    """SQL selecting rows in [start, end): minute rows where we still have them,
+    hourly rows for anything older."""
+    first = db.execute("SELECT MIN(ts) FROM minute").fetchone()[0]
+    cutoff = end if first is None else first // 3600 * 3600
+    if start >= cutoff:
+        return "SELECT * FROM minute WHERE ts >= ? AND ts < ?", (start, end)
+    return ("SELECT * FROM hourly WHERE ts >= ? AND ts < ? "
+            "UNION ALL SELECT * FROM minute WHERE ts >= ? AND ts < ?",
+            (start, min(end, cutoff), max(start, cutoff), end))
+
+
+def bucketed(db, start, end, nbuckets):
+    """{gpu: [row-or-None]*nbuckets}, row = dict of aggregated metrics."""
+    span = end - start
+    src, params = data_source(db, start, end)
+    q = """SELECT CAST((ts - ?) * ? / ? AS INTEGER) AS b, gpu,
+                  AVG(util), MAX(util_max), AVG(mem), MAX(mem_max), AVG(power), MAX(temp), COUNT(*)
+           FROM (%s) GROUP BY b, gpu""" % src
+    out = {}
+    for b, gpu, util, umax, mem, mmax, power, temp, cnt in db.execute(q, (start, nbuckets, span) + params):
+        if 0 <= b < nbuckets:
+            out.setdefault(gpu, [None] * nbuckets)[b] = {
+                "util": util, "util_max": umax, "mem": mem, "mem_max": mmax,
+                "power": power, "temp": temp}
+    return out
+
+
+def range_stats(db, start, end):
+    """{gpu: {util, util_max, mem, mem_max, power, active, mem_pct, mem_active}} over [start, end).
+    active / mem_active are the share of rows with util / memory used >= 5%."""
+    src, params = data_source(db, start, end)
+    q = """SELECT gpu, AVG(util), MAX(util_max), AVG(mem), MAX(mem_max), AVG(power),
+                  SUM(CASE WHEN util >= 5 THEN 1.0 ELSE 0 END) / COUNT(*),
+                  AVG(mem_pct), SUM(CASE WHEN mem_pct >= 5 THEN 1.0 ELSE 0 END) / COUNT(*)
+           FROM (SELECT s.*, 100.0 * s.mem / NULLIF(g.mem_total, 0) AS mem_pct
+                 FROM (%s) s LEFT JOIN gpus g ON g.gpu = s.gpu) GROUP BY gpu""" % src
+    return {r[0]: {"util": r[1], "util_max": r[2], "mem": r[3], "mem_max": r[4],
+                   "power": r[5], "active": r[6], "mem_pct": r[7], "mem_active": r[8]}
+            for r in db.execute(q, params)}
+
+
+def latest(db):
+    """Most recent minute row per GPU and its timestamp."""
+    ts = db.execute("SELECT MAX(ts) FROM minute").fetchone()[0]
+    if ts is None:
+        return None, {}
+    rows = db.execute("SELECT gpu, util, util_max, mem, mem_max, power, temp FROM minute WHERE ts = ?", (ts,))
+    return ts, {r[0]: {"util": r[1], "util_max": r[2], "mem": r[3], "mem_max": r[4],
+                       "power": r[5], "temp": r[6]} for r in rows}
+
+
+def live_sample():
+    """Instant reading straight from NVML (any user may query it), or None."""
+    try:
+        nv = NVML()
+    except NVMLError:
+        return None
+    try:
+        out = {}
+        for i in range(len(nv.handles)):
+            util, mem, power, temp = nv.sample(i)
+            out[i] = {"util": util, "mem": mem, "power": power, "temp": temp}
+        return out
+    except NVMLError:
+        return None
+    finally:
+        nv.close()
+
+
+def owners_by_gpu(db, start, end):
+    """{gpu: [owner, ...]} ordered by minutes present in [start, end)."""
+    src, params = owner_source(db, start, end)
+    q = "SELECT gpu, owner, SUM(minutes) AS m FROM (%s) GROUP BY gpu, owner ORDER BY gpu, m DESC" % src
+    out = {}
+    for gpu, owner, _ in db.execute(q, params):
+        out.setdefault(gpu, []).append(owner)
+    return out
+
+
+def occupied_buckets(db, start, end, nbuckets):
+    """{gpu: set(bucket)} of buckets in which any process held the GPU."""
+    src, params = owner_source(db, start, end)
+    q = "SELECT DISTINCT CAST((ts - ?) * ? / ? AS INTEGER), gpu FROM (%s)" % src
+    out = {}
+    for b, gpu in db.execute(q, (start, nbuckets, end - start) + params):
+        if 0 <= b < nbuckets:
+            out.setdefault(gpu, set()).add(b)
+    return out
+
+
+def owner_source(db, start, end):
+    """Rows of (ts, gpu, owner, minutes, mem, util_sum) in [start, end)."""
+    first = db.execute("SELECT MIN(ts) FROM proc_minute").fetchone()[0]
+    cutoff = end if first is None else first // 3600 * 3600
+    minute_q = ("SELECT p.ts, p.gpu, p.owner, 1 AS minutes, p.mem, COALESCE(m.util, 0) AS util_sum "
+                "FROM proc_minute p LEFT JOIN minute m ON m.ts = p.ts AND m.gpu = p.gpu "
+                "WHERE p.ts >= ? AND p.ts < ?")
+    if start >= cutoff:
+        return minute_q, (start, end)
+    return ("SELECT ts, gpu, owner, minutes, mem, util_sum FROM proc_hourly WHERE ts >= ? AND ts < ? "
+            "UNION ALL " + minute_q, (start, min(end, cutoff), max(start, cutoff), end))
+
+
+# --------------------------------------------------------------------------
+# Terminal rendering
+# --------------------------------------------------------------------------
+
+class Style:
+    def __init__(self, mode):
+        if mode == "auto":
+            on = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
+                  and os.environ.get("TERM", "") != "dumb")
+        else:
+            on = mode == "always"
+        self.on = on
+        self.truecolor = on and os.environ.get("COLORTERM", "") in ("truecolor", "24bit")
+
+    def sgr(self, code, text):
+        return "\033[%sm%s\033[0m" % (code, text) if self.on else text
+
+    def bold(self, t):
+        return self.sgr("1", t)
+
+    def dim(self, t):
+        return self.sgr("2", t)
+
+    def warn(self, t):
+        return self.sgr("33", t)
+
+    # 0 (nothing on the GPU) is a dark navy; anything above 0 starts at a
+    # clearly different brown and brightens through amber to pale yellow, so
+    # 1% never looks like 0%.
+    ZERO_RGB, ZERO_256 = (28, 38, 74), 17
+    RAMP_RGB = [(150, 70, 15), (190, 95, 20), (220, 125, 30), (238, 158, 50),
+                (248, 192, 90), (252, 222, 150), (255, 244, 215)]
+    RAMP_256 = [130, 166, 172, 208, 214, 220, 221, 222, 229]
+
+    def level_color(self, frac):
+        frac = min(1.0, max(0.0, frac))
+        if frac == 0:
+            return "38;2;%d;%d;%d" % self.ZERO_RGB if self.truecolor else "38;5;%d" % self.ZERO_256
+        if self.truecolor:
+            x = frac * (len(self.RAMP_RGB) - 1)
+            i = min(int(x), len(self.RAMP_RGB) - 2)
+            t = x - i
+            a, b = self.RAMP_RGB[i], self.RAMP_RGB[i + 1]
+            r, g, bl = (round(a[k] + (b[k] - a[k]) * t) for k in range(3))
+            return "38;2;%d;%d;%d" % (r, g, bl)
+        return "38;5;%d" % self.RAMP_256[min(len(self.RAMP_256) - 1, int(frac * len(self.RAMP_256)))]
+
+    SHADES = " ░▒▓█"
+
+    def cell(self, frac, held=None):
+        """One heatmap character for a value in [0,1], or None = no data.
+        held: True = a process holds the GPU (drawn as at least 1%),
+        False = none does (drawn as 0), None = unknown (value as is)."""
+        if frac is None:
+            return self.dim("·")
+        if held is not None:
+            frac = max(frac, 0.01) if held else 0.0
+        if self.on:
+            return self.sgr(self.level_color(frac), "█")
+        return self.SHADES[0] if frac <= 0 else self.SHADES[min(4, max(1, int(round(frac * 4))))]
+
+    def legend(self):
+        steps = [0, 0.01, 0.2, 0.35, 0.5, 0.65, 0.8, 1.0]
+        if self.on:
+            bar = "".join(self.cell(s) * 2 for s in steps)
+        else:
+            bar = "".join(c * 2 for c in self.SHADES)
+        return bar
+
+
+METRICS = {
+    # key: (label, row field, unit, scale-fn(gpu_info) -> max value)
+    "util": ("GPU utilization", "util", "%", lambda g: 100.0),
+    "mem": ("memory used", "mem", "GiB", lambda g: float(g.get("mem_total") or 1)),
+    "power": ("power draw", "power", "W", lambda g: float(g.get("power_limit") or 400)),
+    "temp": ("temperature", "temp", "C", lambda g: 90.0),
+}
+
+
+def parse_range(s):
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhdw]?)\s*", s.lower())
+    if not m:
+        raise argparse.ArgumentTypeError("bad range %r (try 1h, 24h, 7d, 30d)" % s)
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "": 3600}[m.group(2)]
+    secs = int(float(m.group(1)) * mult)
+    if secs < 300:
+        raise argparse.ArgumentTypeError("range must be at least 5m")
+    return secs
+
+
+def fmt_span(secs):
+    if secs <= 2 * 86400 and secs % 3600 == 0:
+        return "%dh" % (secs // 3600)
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= n and secs % n == 0:
+            return "%d%s" % (secs // n, unit)
+    return "%dm" % (secs // 60)
+
+
+def fmt_mem(mib):
+    return "-" if mib is None else "%.1f" % (mib / 1024.0)
+
+
+def fmt_pct(v):
+    return "  -" if v is None else "%3.0f" % v
+
+
+def term_width(args):
+    return getattr(args, "width", None) or shutil.get_terminal_size((100, 24)).columns
+
+
+def pick_ticks(start, end, ncols):
+    """[(col, label)] for nicely spaced time ticks along a time axis."""
+    span = end - start
+    steps = [300, 600, 900, 1800, 3600, 7200, 3 * 3600, 6 * 3600, 12 * 3600, 86400, 2 * 86400, 7 * 86400]
+    label_w = 6 if span <= 2 * 86400 else 9
+    for step in steps:
+        if ncols * step / span >= label_w + 3:
+            break
+    tz = time.localtime(end).tm_gmtoff
+    t = (start + tz) // step * step - tz
+    if t < start:
+        t += step
+    out = []
+    while t < end:
+        lt = time.localtime(t)
+        if step >= 86400:
+            label = time.strftime("%a %d", lt)
+        elif span > 86400 and lt.tm_hour == 0 and lt.tm_min == 0:
+            label = time.strftime("%a", lt)
+        else:
+            label = time.strftime("%H:%M", lt)
+        out.append((int((t - start) * ncols / span), label))
+        t += step
+    return out
+
+
+def time_axis(start, end, ncols, indent):
+    marks = [" "] * ncols
+    labels = [" "] * (ncols + 12)
+    for col, label in pick_ticks(start, end, ncols):
+        if col >= ncols:
+            continue
+        marks[col] = "╵"
+        if col + len(label) <= ncols + 1 and all(c == " " for c in labels[max(0, col - 1):col + len(label) + 1]):
+            labels[col:col + len(label)] = list(label)
+    return [" " * indent + "".join(marks), " " * indent + "".join(labels).rstrip()]
+
+
+def in_use(row):
+    """Whether utilization / memory alone show the GPU in use (same limits as `gpumon free`)."""
+    return (row.get("util") or 0) >= 5 or (row.get("mem") or 0) >= 1024
+
+
+def heatmap(st, db, gpus, info, start, end, metric, width, title, occupancy=False):
+    """occupancy: draw buckets where the GPU was unused (no process seen, no
+    real activity) as 0, and all others as at least 1%."""
+    label_w = 7
+    ncols = max(10, width - label_w - 1)
+    span = end - start
+    native = max(1, span // 60) if start >= end - MINUTE_RETENTION else max(1, span // 3600)
+    nb = min(ncols, native)
+    # Stretch the nb buckets over all ncols columns (some get one column more).
+    col_bucket = [c * nb // ncols for c in range(ncols)]
+    data = bucketed(db, start, end, nb)
+    occupied = occupied_buckets(db, start, end, nb) if occupancy else None
+    _, field, unit, scale = METRICS[metric]
+    res = ("1 column = %s" if nb == ncols else "%s resolution") % fmt_bucket(span / nb)
+    lines = [st.bold(title) + st.dim("   (%s)" % res)]
+    for g in gpus:
+        mx = scale(info.get(g, {}))
+        row = data.get(g, [None] * nb)
+        vals = [None if r is None or r[field] is None else r[field] / mx for r in row]
+        if occupied is None:
+            used = [None] * nb
+        else:
+            held = occupied.get(g, set())
+            used = [b in held or (r is not None and in_use(r)) for b, r in enumerate(row)]
+        cells = (st.cell(vals[b], used[b]) for b in col_bucket)
+        lines.append("GPU %-2d " % g + " " + "".join(cells))
+    lines += time_axis(start, end, ncols, label_w + 1)
+    return lines
+
+
+def fmt_bucket(secs):
+    if secs < 90:
+        return "%ds" % round(secs) if secs < 60 else "1 min"
+    if secs < 5400:
+        return "%d min" % round(secs / 60)
+    if secs < 86400 * 1.5:
+        return "%.1f h" % (secs / 3600)
+    return "%.1f d" % (secs / 86400)
+
+
+EIGHTHS = " ▁▂▃▄▅▆▇█"
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def area_chart(st, db, gpus, info, start, end, metric, width, height=8):
+    """Mean of the metric across the selected GPUs, as a filled column chart."""
+    label, field, unit, scale = METRICS[metric]
+    ylab_w = 6
+    ncols = max(10, width - ylab_w - 2)
+    data = bucketed(db, start, end, ncols)
+    total_max = sum(scale(info.get(g, {})) for g in gpus) / max(1, len(gpus))
+    vals = []
+    for c in range(ncols):
+        xs = [data[g][c][field] for g in gpus if g in data and data[g][c] and data[g][c][field] is not None]
+        vals.append(sum(xs) / len(xs) if xs else None)
+    disp = (lambda v: v / 1024.0) if metric == "mem" else (lambda v: v)
+    top = disp(total_max)
+    lines = []
+    for row in range(height, 0, -1):
+        lo = (row - 1) / height
+        chars = []
+        for v in vals:
+            if v is None:
+                chars.append(st.dim("·") if row == 1 else " ")
+                continue
+            frac = min(1.0, v / total_max)
+            fill = (frac - lo) * height
+            ch = EIGHTHS[max(0, min(8, int(round(fill * 8))))] if fill < 1 else "█"
+            chars.append(st.sgr("38;5;74", ch) if st.on and ch != " " else ch)
+        if row == height:
+            ylab = "%5.0f" % top
+        elif row == height // 2:
+            ylab = "%5.0f" % (top * row / height)
+        else:
+            ylab = "     "
+        lines.append(st.dim(ylab) + " " + st.dim("┤") + "".join(chars))
+    lines.append(st.dim("    0 └" + "─" * ncols))
+    lines += time_axis(start, end, ncols, ylab_w + 1)
+    known = [v for v in vals if v is not None]
+    if known:
+        avg = sum(known) / len(known)
+        suffix = " %s" % unit
+        lines.insert(0, st.bold("Mean %s across %s" % (label, "all GPUs" if len(gpus) > 1 else "GPU %d" % gpus[0]))
+                     + st.dim("   avg %.1f%s, peak col %.1f%s, scale 0-%.0f%s"
+                              % (disp(avg), suffix, disp(max(known)), suffix, top, suffix)))
+    else:
+        lines.insert(0, st.bold("Mean %s" % label) + st.dim("   (no data in range)"))
+    return lines
+
+
+def header(st, db, info, extra=""):
+    names = sorted(set(v["name"] for v in info.values()))
+    host = socket.gethostname()
+    model = ", ".join("%d× %s" % (sum(1 for v in info.values() if v["name"] == n), n.replace("NVIDIA ", ""))
+                      for n in names)
+    ts, _ = latest(db)
+    age = "no samples yet" if ts is None else "last sample %s ago" % ago(time.time() - ts - 60)
+    stale = ts is None or time.time() - ts > 300
+    line = "%s  %s  %s" % (st.bold("gpumon @ " + host), model, st.dim(time.strftime("%Y-%m-%d %H:%M")))
+    out = [line + ("  " + extra if extra else "")]
+    out.append((st.warn("⚠ collector looks stopped: " + age) if stale else st.dim(age)))
+    return out
+
+
+def ago(secs):
+    secs = max(0, int(secs))
+    if secs < 90:
+        return "%ds" % secs
+    if secs < 5400:
+        return "%dm" % (secs // 60)
+    if secs < 172800:
+        return "%.1fh" % (secs / 3600)
+    return "%.1fd" % (secs / 86400)
+
+
+def select_gpus(args, info):
+    gpus = sorted(info)
+    if getattr(args, "gpus", None):
+        want = set()
+        for part in args.gpus.split(","):
+            if "-" in part:
+                a, b = part.split("-", 1)
+                want.update(range(int(a), int(b) + 1))
+            elif part.strip():
+                want.add(int(part))
+        gpus = [g for g in gpus if g in want]
+        if not gpus:
+            sys.exit("gpumon: no matching GPUs (have %s)" % ",".join(map(str, sorted(info))))
+    return gpus
+
+
+_DOMAIN_RE = re.compile(r"[@-][a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:edu|com|org|net|gov|io|local|lan|internal|[a-z]{2})(?=-|$)", re.I)
+
+
+def short_owner(o, n=22):
+    """Drop domain parts (user@example.edu, ctr:user-example.edu-job) and truncate."""
+    o = _DOMAIN_RE.sub("", o)
+    return o if len(o) <= n else o[:n - 1] + "…"
+
+
+def render_overview(args, st):
+    db = open_ro(args)
+    info = gpu_info(db)
+    if not info:
+        return header(st, db, info) + ["", "No GPUs recorded yet; the collector writes its first row after ~1 minute."]
+    gpus = select_gpus(args, info)
+    width = term_width(args)
+    now = int(time.time())
+    end = now // 60 * 60
+    live = live_sample()
+    _, last = latest(db)
+    stats = {r: range_stats(db, end - s, end) for r, s in (("1h", 3600), ("24h", 86400), ("7d", 7 * 86400))}
+    owners = owners_by_gpu(db, end - 3600, end)
+    holding = owners_by_gpu(db, end - 120, end)  # processes in the latest minute rows
+    memory = args.basis == "memory"
+    avg_key, act_key = ("mem_pct", "mem_active") if memory else ("util", "active")
+    out = header(st, db, info, st.dim("utilization = %s" % args.basis))
+    out.append("")
+    row_fmt = "%-3s %s %4s %-9s │ %4s %4s %4s │ %4s %4s │ %s"
+    out.append(st.dim(" " * 21 + ("│ avg mem used   " if memory else "│ avg util       ") + "│ active    │"))
+    out.append(st.bold(row_fmt % ("GPU", " ", "now", "mem GiB", "1h", "24h", "7d", "24h", "7d", "users (last 1h)")))
+    for g in gpus:
+        cur = (live or {}).get(g) or last.get(g) or {}
+        if memory:
+            m, total = cur.get("mem"), info[g]["mem_total"]
+            u = 100.0 * m / total if m is not None and total else None
+        else:
+            u = cur.get("util")
+        nowtxt = (fmt_pct(u) + "%") if u is not None else "   -"
+        memtxt = "%4s/%-4.0f" % (fmt_mem(cur.get("mem")), info[g]["mem_total"] / 1024.0)
+        avgs = [fmt_pct(stats[r].get(g, {}).get(avg_key)) + "%" for r in ("1h", "24h", "7d")]
+        act = ["%3s%%" % ("%.0f" % (100 * stats[r][g][act_key]) if g in stats[r] else "-")
+               for r in ("24h", "7d")]
+        nowcell = st.cell(None if u is None else u / 100.0, g in holding or in_use(cur))
+        line = row_fmt % tuple([g, nowcell, nowtxt, memtxt] + avgs + act + [""])
+        room = max(8, width - len(ANSI_RE.sub("", line)))
+        who = ", ".join(short_owner(o, room) for o in owners.get(g, []))
+        if len(who) > room:
+            who = who[:room - 1] + "…"
+        out.append(line + (who or st.dim("-")))
+    out.append(st.dim("active = share of minutes with %s >= 5%%.  users = processes in the last hour;"
+                      % ("memory used" if memory else "util")))
+    out.append(st.dim("containers are shown as ctr:<name>.  --memory / --compute picks the utilization measure."))
+    metric, what = ("mem", "GPU memory used") if memory else ("util", "GPU utilization")
+    for label, span in (("Last hour", 3600), ("Last 24 hours", 86400), ("Last 7 days", 7 * 86400)):
+        out.append("")
+        out += heatmap(st, db, gpus, info, end - span, end, metric, width, "%s - %s" % (label, what),
+                       occupancy=True)
+    out.append("")
+    out.append(st.dim("scale: 0% ") + st.legend() + st.dim(" 100%    · = no data"))
+    out.append(st.dim("0 = unused (no process, <5% util, <1 GiB); anything in use shows as at least 1%."))
+    out.append(st.dim("more: gpumon show -r 24h | gpumon users | gpumon free | gpumon -h"))
+    return out
+
+
+def render_show(args, st):
+    db = open_ro(args)
+    info = gpu_info(db)
+    gpus = select_gpus(args, info)
+    width = term_width(args)
+    end = int(time.time()) // 60 * 60
+    start = end - args.range
+    label, field, unit, scale = METRICS[args.metric]
+    out = header(st, db, info, st.dim("range %s, metric %s" % (fmt_span(args.range), args.metric)))
+    out.append("")
+    occupancy = args.metric in ("util", "mem")
+    out += heatmap(st, db, gpus, info, start, end, args.metric, width,
+                   "Last %s - %s" % (fmt_span(args.range), label), occupancy=occupancy)
+    lo_lab = {"util": "0%", "mem": "0 GiB", "power": "0 W", "temp": "0 C"}[args.metric]
+    hi_lab = {"util": "100%", "mem": "full", "power": "power limit", "temp": "90 C"}[args.metric]
+    out.append(st.dim("scale: %s " % lo_lab) + st.legend() + st.dim(" %s    · = no data" % hi_lab))
+    out.append("")
+    if not args.no_chart:
+        out += area_chart(st, db, gpus, info, start, end, args.metric, width, height=args.height)
+        out.append("")
+    stats = range_stats(db, start, end)
+    owners = owners_by_gpu(db, start, end)
+    out.append(st.bold("GPU  util avg  peak  active  mem avg/peak GiB    power avg  users"))
+    for g in gpus:
+        s = stats.get(g)
+        if not s:
+            out.append("%-3d  %s" % (g, st.dim("no data")))
+            continue
+        who = ", ".join(short_owner(o, 16) for o in owners.get(g, [])[:3])
+        out.append("%-3d  %7s%%  %3.0f%%  %5.0f%%  %5s / %-5s of %-4s  %6s W  %s" % (
+            g, fmt_pct(s["util"]), s["util_max"] or 0, 100 * (s["active"] or 0),
+            fmt_mem(s["mem"]), fmt_mem(s["mem_max"]), "%.0f" % (info[g]["mem_total"] / 1024.0),
+            "-" if s["power"] is None else "%.0f" % s["power"], who or st.dim("-")))
+    return out
+
+
+def render_users(args, st):
+    db = open_ro(args)
+    info = gpu_info(db)
+    gpus = set(select_gpus(args, info))
+    end = int(time.time()) // 60 * 60
+    start = end - args.range
+    src, params = owner_source(db, start, end)
+    q = """SELECT owner, gpu, SUM(minutes), SUM(util_sum), SUM(mem * minutes), MAX(ts)
+           FROM (%s) GROUP BY owner, gpu""" % src
+    agg = {}
+    for owner, gpu, mins, usum, memsum, last_ts in db.execute(q, params):
+        if gpu not in gpus:
+            continue
+        a = agg.setdefault(owner, {"mins": 0, "usum": 0, "memsum": 0, "gpus": set(), "last": 0})
+        a["mins"] += mins
+        a["usum"] += usum or 0
+        a["memsum"] += memsum or 0
+        a["gpus"].add(gpu)
+        a["last"] = max(a["last"], last_ts)
+    out = header(st, db, info, st.dim("range %s" % fmt_span(args.range)))
+    out.append("")
+    if not agg:
+        out.append("No GPU processes recorded in the last %s." % fmt_span(args.range))
+        return out
+    total_gpu_hours = len(gpus) * args.range / 3600.0
+    out.append(st.bold("%-34s %9s %9s %8s %8s  %-14s %s" % (
+        "owner", "GPU-hours", "busy GPUh", "avg util", "avg GiB", "GPUs", "last seen")))
+    for owner, a in sorted(agg.items(), key=lambda kv: -kv[1]["mins"]):
+        gh = a["mins"] / 60.0
+        busy = a["usum"] / 100.0 / 60.0
+        out.append("%-34s %9.1f %9.1f %7.0f%% %8.1f  %-14s %s" % (
+            short_owner(owner, 34), gh, busy, a["usum"] / a["mins"], a["memsum"] / a["mins"] / 1024.0,
+            compact_ranges(sorted(a["gpus"])), ago(end - 60 - a["last"]) + " ago" if end - 120 > a["last"] else "now"))
+    out.append("")
+    out.append(st.dim("GPU-hours = time a process held the GPU (of %.0f possible). busy GPUh weights that by the GPU's"
+                      " utilization; GPUs shared by several owners count toward each." % total_gpu_hours))
+    return out
+
+
+def compact_ranges(xs):
+    parts, i = [], 0
+    while i < len(xs):
+        j = i
+        while j + 1 < len(xs) and xs[j + 1] == xs[j] + 1:
+            j += 1
+        parts.append(str(xs[i]) if i == j else "%d-%d" % (xs[i], xs[j]))
+        i = j + 1
+    return ",".join(parts)
+
+
+def render_free(args, st):
+    db = open_ro(args)
+    info = gpu_info(db)
+    gpus = select_gpus(args, info)
+    end = int(time.time()) // 60 * 60
+    live = live_sample() or {}
+    _, last = latest(db)
+    recent = range_stats(db, end - args.range, end)
+    owners = owners_by_gpu(db, end - 600, end)
+    out = header(st, db, info)
+    out.append("")
+    out.append(st.bold("GPU  status   util now  mem now GiB   util avg %-4s  mem peak %-4s" % (
+        fmt_span(args.range), fmt_span(args.range))))
+    free_ids = []
+    for g in gpus:
+        cur = live.get(g) or last.get(g) or {}
+        s = recent.get(g, {})
+        u, mem = cur.get("util"), cur.get("mem")
+        free = (u is not None and u < 5 and mem is not None and mem < 1024 and not owners.get(g)
+                and (s.get("util_max") or 0) < 20)
+        if free:
+            free_ids.append(str(g))
+        status = st.sgr("32", "free    ") if free else st.sgr("33", "in use  ")
+        out.append("%-3d  %s %7s%%  %5s/%-5s   %8s%%     %8s" % (
+            g, status, fmt_pct(u), fmt_mem(mem), fmt_mem(info[g]["mem_total"]),
+            fmt_pct(s.get("util")), fmt_mem(s.get("mem_max"))))
+    out.append("")
+    if free_ids:
+        out.append("%d free: CUDA_VISIBLE_DEVICES=%s" % (len(free_ids), ",".join(free_ids)))
+    else:
+        out.append("No GPU is idle right now.")
+    out.append(st.dim("free = <5%% util and <1 GiB used now, no processes in the last 10 min, peak util < 20%% over %s."
+                      % fmt_span(args.range)))
+    return out
+
+
+def cmd_status(args):
+    path = db_path(args)
+    pid = collector_pid(args)
+    print("data dir : %s" % data_dir(args))
+    print("collector: %s" % ("running (pid %d)" % pid if pid and pid > 0 else "running" if pid else "NOT running"))
+    if not os.path.exists(path):
+        print("database : missing")
+        return 1
+    size = sum(os.path.getsize(os.path.join(data_dir(args), f)) for f in os.listdir(data_dir(args))
+               if os.path.isfile(os.path.join(data_dir(args), f)))
+    db = open_ro(args)
+    ts, _ = latest(db)
+    rng = db.execute("SELECT MIN(ts) FROM (SELECT ts FROM hourly UNION ALL SELECT ts FROM minute)").fetchone()[0]
+    counts = {t: db.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
+              for t in ("minute", "hourly", "proc_minute", "proc_hourly")}
+    print("storage  : %.1f MiB total in data dir" % (size / 1048576.0))
+    print("rows     : " + ", ".join("%s=%d" % kv for kv in counts.items()))
+    if ts:
+        print("last row : %s (%s ago)" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)),
+                                         ago(time.time() - ts - 60)))
+    if rng:
+        print("history  : since %s" % time.strftime("%Y-%m-%d %H:%M", time.localtime(rng)))
+    return 0
+
+
+def cmd_export(args):
+    db = open_ro(args)
+    info = gpu_info(db)
+    gpus = set(select_gpus(args, info))
+    end = int(time.time()) // 60 * 60
+    src, params = data_source(db, end - args.range, end)
+    w = csv.writer(sys.stdout)
+    w.writerow(["time", "gpu", "util_avg", "util_max", "mem_mib", "mem_max_mib", "power_w", "temp_c", "samples"])
+    for row in db.execute("SELECT * FROM (%s) ORDER BY ts, gpu" % src, params):
+        if row[1] in gpus:
+            w.writerow([dt.datetime.fromtimestamp(row[0]).isoformat()] + list(row[1:]))
+    return 0
+
+
+def run_view(args, renderer):
+    st = Style(args.color)
+    if not args.watch:
+        print("\n".join(renderer(args, st)))
+        return 0
+    try:
+        while True:
+            lines = renderer(args, st)
+            sys.stdout.write("\033[H\033[2J" + "\n".join(lines) + "\n" +
+                             st.dim("refreshing every %ds - Ctrl-C to quit" % args.watch))
+            sys.stdout.flush()
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        print()
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="gpumon", description="GPU usage history in the terminal.",
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog="examples:\n  gpumon\n  gpumon --memory\n  gpumon show -r 24h -m mem\n"
+                                       "  gpumon show -r 7d -g 0-3\n  gpumon users -r 7d\n"
+                                       "  gpumon free\n  gpumon -w 30")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--data", help="data directory (default %s, or $GPUMON_DATA)" % DEFAULT_DATA_DIR)
+    view = argparse.ArgumentParser(add_help=False, parents=[common])
+    view.add_argument("-g", "--gpus", help="GPU subset, e.g. 0,2,4-7")
+    view.add_argument("-w", "--watch", type=int, metavar="SEC", help="redraw every SEC seconds")
+    view.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    view.add_argument("--width", type=int, help="override terminal width")
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("overview", parents=[view], help="now / 1h / 24h / 7d at a glance (default)")
+    basis = sp.add_mutually_exclusive_group()
+    basis.add_argument("--compute", dest="basis", action="store_const", const="compute",
+                       help="utilization = GPU compute busy %% (default)")
+    basis.add_argument("--memory", dest="basis", action="store_const", const="memory",
+                       help="utilization = GPU memory used %% (memory held blocks co-scheduling)")
+    sp.set_defaults(basis="compute")
+    sp.set_defaults(func=lambda a: run_view(a, render_overview))
+
+    sp = sub.add_parser("show", parents=[view], help="heatmap + chart for one time range")
+    sp.add_argument("-r", "--range", type=parse_range, default=3600, help="e.g. 1h, 24h, 7d, 30d (default 1h)")
+    sp.add_argument("-m", "--metric", choices=sorted(METRICS), default="util")
+    sp.add_argument("--height", type=int, default=8, help="chart height in rows")
+    sp.add_argument("--no-chart", action="store_true")
+    sp.set_defaults(func=lambda a: run_view(a, render_show))
+
+    sp = sub.add_parser("users", parents=[view], help="GPU time per user / container")
+    sp.add_argument("-r", "--range", type=parse_range, default=86400, help="default 24h")
+    sp.set_defaults(func=lambda a: run_view(a, render_users))
+
+    sp = sub.add_parser("free", parents=[view], help="which GPUs are idle right now")
+    sp.add_argument("-r", "--range", type=parse_range, default=900, help="look-back for 'recently idle' (15m)")
+    sp.set_defaults(func=lambda a: run_view(a, render_free))
+
+    sp = sub.add_parser("status", parents=[common], help="collector health and storage")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("export", parents=[view], help="CSV of stored rows")
+    sp.add_argument("-r", "--range", type=parse_range, default=86400)
+    sp.set_defaults(func=cmd_export)
+
+    sp = sub.add_parser("collect", parents=[common], help="run the collector (used by cron)")
+    sp.add_argument("--interval", type=int, default=SAMPLE_INTERVAL, help="seconds between samples")
+    sp.add_argument("-f", "--foreground", action="store_true", help="also log to stderr")
+    sp.add_argument("-q", "--quiet", action="store_true", help="say nothing if already running")
+    sp.set_defaults(func=cmd_collect)
+
+    sp = sub.add_parser("stop", parents=[common], help="stop the collector")
+    sp.set_defaults(func=cmd_stop)
+
+    p.add_argument("--version", action="version", version="gpumon " + VERSION)
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv or argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version"):
+        argv = ["overview"] + argv
+    args = p.parse_args(argv)
+    try:
+        return args.func(args) or 0
+    except BrokenPipeError:
+        return 0
+    except sqlite3.OperationalError as e:
+        sys.exit("gpumon: database error: %s" % e)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
