@@ -1,58 +1,63 @@
 #!/usr/bin/env bash
-# Install gpumon into a world-readable location and keep the collector running
-# via the invoking user's crontab (no root needed).
+# Install gpumon system-wide. Run as root:
 #
-#   ./install.sh               install / upgrade and (re)start the collector
-#   ./install.sh --uninstall   stop the collector and remove the cron entries
-#                              (data is left in place; delete it by hand)
+#   sudo ./install.sh               install / upgrade and (re)start the collector
+#   sudo ./install.sh --uninstall   stop the collector and remove the program
+#                                   (data in /var/lib/gpumon is left in place)
 #
-# GPUMON_PREFIX overrides the install location (default /var/tmp/gpumon).
+# Puts the command in /usr/local/bin (already on everyone's PATH), keeps data in
+# /var/lib/gpumon, and runs the collector as the systemd service gpumon.service.
 set -euo pipefail
 
-PREFIX="${GPUMON_PREFIX:-/var/tmp/gpumon}"
+BIN=/usr/local/bin/gpumon
+DATA=/var/lib/gpumon
+DOC=/usr/local/share/doc/gpumon
+UNIT=/etc/systemd/system/gpumon.service
 SRC="$(cd "$(dirname "$0")" && pwd)"
-TAG="# gpumon-collector"
 
-remove_cron() {
-    (crontab -l 2>/dev/null | grep -vF "$TAG" || true) | crontab -
-}
-
-if [[ "${1:-}" == "--uninstall" ]]; then
-    remove_cron
-    [[ -x "$PREFIX/gpumon" ]] && "$PREFIX/gpumon" stop || true
-    echo "Removed cron entries. Data remains in $PREFIX/data."
-    exit 0
-fi
-
-if [[ -e "$PREFIX" && "$(stat -c %u "$PREFIX")" != "$(id -u)" ]]; then
-    echo "error: $PREFIX exists and belongs to another user" >&2
+if [[ $(id -u) -ne 0 ]]; then
+    echo "error: run as root (sudo $0)" >&2
     exit 1
 fi
 
+if [[ "${1:-}" == "--uninstall" ]]; then
+    systemctl disable --now gpumon.service 2>/dev/null || true
+    rm -f "$UNIT" "$BIN"
+    rm -rf "$DOC"
+    systemctl daemon-reload
+    echo "Removed gpumon. Data remains in $DATA."
+    exit 0
+fi
+
 umask 022
-mkdir -p "$PREFIX/data"
-chmod 755 "$PREFIX" "$PREFIX/data"
+install -d -m 755 "$DATA" "$DOC"
+# Anyone may create claim files; the sticky bit lets only their owner delete them.
+install -d -m 1777 "$DATA/claims"
+touch "$DATA/claims/.lock"
+chmod 644 "$DATA/claims/.lock"
 
-# Stop an older collector so the new code takes over.
-[[ -x "$PREFIX/gpumon" ]] && "$PREFIX/gpumon" stop >/dev/null 2>&1 || true
+install -m 755 "$SRC/gpumon" "$BIN.new"
+mv -f "$BIN.new" "$BIN"
+install -m 644 "$SRC/README.md" "$DOC/README.md"
 
-sed "s|^DEFAULT_DATA_DIR = .*|DEFAULT_DATA_DIR = \"$PREFIX/data\"|" "$SRC/gpumon" > "$PREFIX/gpumon.new"
-chmod 755 "$PREFIX/gpumon.new"
-mv -f "$PREFIX/gpumon.new" "$PREFIX/gpumon"
-cp "$SRC/README.md" "$PREFIX/README.md"
-chmod 644 "$PREFIX/README.md"
+cat > "$UNIT" <<EOF
+[Unit]
+Description=gpumon GPU usage collector
+After=nvidia-persistenced.service docker.service
 
-# @reboot starts it after boot; the periodic entry restarts it if it ever dies
-# (a second copy exits immediately because the first holds the lock).
-CMD="$PREFIX/gpumon collect -q >/dev/null 2>&1"
-remove_cron
-(crontab -l 2>/dev/null || true; echo "@reboot sleep 60; $CMD $TAG"; echo "*/10 * * * * $CMD $TAG") | crontab -
+[Service]
+ExecStart=$BIN collect
+Restart=always
+RestartSec=30
 
-# Start now, detached from this shell.
-sleep 1
-setsid nohup "$PREFIX/gpumon" collect -q >/dev/null 2>&1 < /dev/null &
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable gpumon.service >/dev/null 2>&1
+systemctl restart gpumon.service
 sleep 2
-"$PREFIX/gpumon" status
+systemctl --no-pager --lines=0 status gpumon.service | head -3
 echo
-echo "Installed. Everyone on this machine can run:  $PREFIX/gpumon"
-echo "Suggested alias:  alias gpumon=$PREFIX/gpumon"
+echo "Installed. Everyone on this machine can now run: gpumon"
